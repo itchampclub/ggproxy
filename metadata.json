@@ -1,0 +1,5 @@
+{
+  "name": "Apps Script Link Proxy",
+  "description": "A tool to shorten Google Apps Script web app URLs and display their content without the default Google banner. Links are stored in local storage and simulated for Google Sheets.",
+  "requestFramePermissions": []
+}
