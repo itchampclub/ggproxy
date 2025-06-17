@@ -1,119 +1,152 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { getLinkMappingFromLocalStorage } from '../services/storageService';
 import { LinkMapping } from '../types';
 
 export const ProxiedContentView: React.FC = () => {
   const { shortCode } = useParams<{ shortCode: string }>();
-  const [htmlContent, setHtmlContent] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [originalUrl, setOriginalUrl] = useState<string | null>(null);
+  const [mapping, setMapping] = useState<LinkMapping | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
 
   useEffect(() => {
+    setIsLoading(true);
+    setError(null);
+    setMapping(null);
+
     if (!shortCode) {
-      setError('No short code provided.');
+      setError('No short code provided in the URL.');
       setIsLoading(false);
       return;
     }
 
-    const mapping: LinkMapping | null = getLinkMappingFromLocalStorage(shortCode);
+    const foundMapping = getLinkMappingFromLocalStorage(shortCode);
 
-    if (!mapping) {
-      setError(`No Google Apps Script URL found for short code: ${shortCode}`);
+    if (!foundMapping) {
+      setError(`No Google Apps Script URL found for the short code: ${shortCode}. This link may have expired or is incorrect.`);
       setIsLoading(false);
       return;
     }
     
-    setOriginalUrl(mapping.originalUrl);
-
-    // Basic fetch - CORS might be an issue if the Apps Script isn't configured for it.
-    // For this demo, we assume it's either allowed or a proxy handles CORS.
-    // A real-world scenario might need a server-side proxy to reliably bypass CORS.
-    fetch(mapping.originalUrl)
-      .then(response => {
-        if (!response.ok) {
-          throw new Error(`Failed to fetch content (Status: ${response.status}). Ensure the Apps Script URL is public and allows access.`);
-        }
-        return response.text();
-      })
-      .then(html => {
-        // Attempt to make relative URLs in the fetched HTML absolute.
-        // This is a common issue when displaying proxied content.
-        // This regex is basic and might not cover all cases.
-        const base = new URL(mapping.originalUrl);
-        const processedHtml = html
-          .replace(/src="\/(?!\/)/g, `src="${base.origin}/`)
-          .replace(/href="\/(?!\/)/g, `href="${base.origin}/`)
-          .replace(/<base\s+href="[^"]*">/, ''); // Remove existing base tags if any
-
-        // Inject a base tag to help resolve relative paths correctly within the iframe.
-        // This is often more reliable than regex replacements.
-        const finalHtml = `<base href="${base.origin}${base.pathname}/">${processedHtml}`;
-
-        setHtmlContent(finalHtml);
-
-      })
-      .catch(err => {
-        console.error('Fetch error:', err);
-        setError(`Error fetching content from Apps Script: ${err.message}. This could be a CORS issue or the URL is invalid/private.`);
-      })
-      .finally(() => {
-        setIsLoading(false);
-      });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    setMapping(foundMapping);
+    // setIsLoading(false) will be handled by iframe's onload or onerror, or if mapping is not found
   }, [shortCode]);
 
-  if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-[calc(100vh-200px)] text-slate-300">
-        <div className="loader ease-linear rounded-full border-4 border-t-4 border-slate-500 h-12 w-12 mb-4"></div>
-        <p className="text-xl">Loading Apps Script content...</p>
-        <p className="text-sm text-slate-400">Fetching from: {originalUrl || 'Unknown URL'}</p>
-      </div>
-    );
-  }
+  // Iframe load/error handlers
+  // Note: onError for cross-origin iframes is not always reliable for specific error types (e.g. X-Frame-Options)
+  // It might trigger for network errors, but X-Frame-Options denial often results in a blank iframe or browser error page without firing iframe.onerror.
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe || !mapping) return;
 
-  if (error) {
+    const handleLoad = () => {
+      setIsLoading(false);
+      setError(null); // Clear any previous error if it somehow loads
+    };
+
+    const handleError = () => {
+      setIsLoading(false);
+      setError(
+        `Failed to load content from the Google Apps Script URL. This could be due to several reasons:
+        1. The original Apps Script URL is invalid, private, or has been deleted.
+        2. The Apps Script is not configured to allow embedding on other websites (due to X-Frame-Options HTTP header). The script owner may need to set XFrameOptionsMode.ALLOWALL.
+        3. Network connectivity issues.`
+      );
+    };
+    
+    // Set loading true when mapping is available and we are about to set src
+    setIsLoading(true);
+    iframe.addEventListener('load', handleLoad);
+    iframe.addEventListener('error', handleError); // Limited utility for X-Frame-Options
+
+    // Set src after attaching event listeners
+    iframe.src = mapping.originalUrl;
+
+    // Fallback timer for cases where 'load' or 'error' doesn't fire as expected (e.g. X-Frame-Options blocking)
+    // Adjust timeout as needed. If X-Frame-Options blocks, 'load' might not fire.
+    const timer = setTimeout(() => {
+        if (isLoading) { // If still loading after timeout
+             // Check if iframe is blank (common for X-Frame-Options issues)
+            let isIframeBlank = false;
+            try {
+                if (iframe.contentDocument && (iframe.contentDocument.body === null || iframe.contentDocument.body.innerHTML.trim() === '')) {
+                    isIframeBlank = true;
+                }
+            } catch (e) {
+                // Cross-origin access error, likely means it's trying to load something but we can't inspect it.
+                // This doesn't necessarily mean X-Frame-Options blocked, could be loading fine.
+            }
+
+            if(isIframeBlank) { // Heuristic for X-Frame-Options
+                 setError(
+                    `The content from the Google Apps Script URL could not be displayed. This is often due to the script's embedding restrictions (X-Frame-Options).
+                    The script owner may need to configure it to allow embedding on external sites (e.g., using XFrameOptionsMode.ALLOWALL in their Apps Script project).
+                    The Google banner, if present, cannot be removed by this tool.`
+                 );
+            }
+            // If not blank, assume it's loading or loaded, but keep loader if it didn't fire load event.
+            // Or, simply give a generic timeout message.
+            // For now, if it's still loading and not obviously blank, we'll let the loader spin. A more robust solution might involve a "stuck?" message.
+            // setIsLoading(false); // Optionally stop loading after timeout
+        }
+    }, 10000); // 10 seconds timeout
+
+    return () => {
+      iframe.removeEventListener('load', handleLoad);
+      iframe.removeEventListener('error', handleError);
+      clearTimeout(timer);
+      // Clear iframe src when component unmounts to stop loading
+      iframe.src = 'about:blank';
+    };
+  }, [mapping, isLoading]); // Add isLoading to dependencies to re-run timeout logic if needed.
+
+
+  if (!mapping && !isLoading && !error) {
+    // Should not happen if logic is correct, but as a fallback
     return (
-      <div className="flex flex-col items-center justify-center h-[calc(100vh-200px)] text-center">
-        <div className="bg-red-800/50 p-8 rounded-lg shadow-xl max-w-lg">
-          <h2 className="text-3xl font-bold text-red-300 mb-4">Error</h2>
-          <p className="text-red-200 mb-6">{error}</p>
-          {originalUrl && <p className="text-xs text-slate-400 mb-2 break-all">Attempted to fetch: {originalUrl}</p>}
-          <Link to="/" className="inline-block bg-sky-500 hover:bg-sky-600 text-white font-semibold py-2 px-4 rounded-lg transition-colors">
-            Go back to Homepage
-          </Link>
+        <div className="flex flex-col items-center justify-center h-[calc(100vh-200px)] text-center">
+            <p className="text-slate-400">Preparing to load content...</p>
         </div>
-      </div>
     );
   }
 
-  if (htmlContent) {
-    return (
-      <div className="w-full h-[calc(100vh-150px)] bg-slate-700 rounded-lg shadow-2xl overflow-hidden">
-        <iframe
-          srcDoc={htmlContent}
-          title={`Proxied Content for ${shortCode}`}
-          className="w-full h-full border-0"
-          // Sandbox attributes can be adjusted based on the Apps Script's needs.
-          // 'allow-scripts' is usually necessary for Apps Script functionality.
-          // 'allow-same-origin' allows the iframe to use its own origin features like local storage.
-          // 'allow-forms' if the app script has forms.
-          // 'allow-popups' if it needs to open popups.
-          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-top-navigation-by-user-activation"
-        />
-      </div>
-    );
-  }
 
   return (
-    <div className="text-center text-slate-400 p-8">
-      <p>No content to display. This usually indicates an issue that wasn't caught by the error handler.</p>
-       <Link to="/" className="mt-4 inline-block bg-sky-500 hover:bg-sky-600 text-white font-semibold py-2 px-4 rounded-lg transition-colors">
-            Go back to Homepage
-      </Link>
+    <div className="w-full h-[calc(100vh-180px)] bg-slate-800 rounded-lg shadow-2xl overflow-hidden flex flex-col">
+      {isLoading && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-800/80 z-10">
+          <div className="loader ease-linear rounded-full border-4 border-t-4 border-slate-500 h-12 w-12 mb-4"></div>
+          <p className="text-xl text-slate-300">Loading Apps Script content...</p>
+          {mapping && <p className="text-sm text-slate-400 mt-1">From: <span className="break-all">{mapping.originalUrl}</span></p>}
+        </div>
+      )}
+      {error && !isLoading && ( // Only show error if not loading
+        <div className="flex-grow flex flex-col items-center justify-center text-center p-4 sm:p-8">
+          <div className="bg-red-900/60 p-6 sm:p-8 rounded-lg shadow-xl max-w-lg">
+            <h2 className="text-2xl sm:text-3xl font-bold text-red-300 mb-4">Error Displaying Content</h2>
+            <p className="text-red-200 mb-6 whitespace-pre-line">{error}</p>
+            {mapping?.originalUrl && <p className="text-xs text-slate-400 mb-2 break-all">Attempted URL: {mapping.originalUrl}</p>}
+            <Link to="/" className="inline-block bg-sky-500 hover:bg-sky-600 text-white font-semibold py-2.5 px-5 rounded-lg transition-colors">
+              Go to Homepage
+            </Link>
+          </div>
+        </div>
+      )}
+      {/* Iframe is always rendered to attach ref, visibility controlled by error/loading states overlaying it */}
+      <iframe
+        ref={iframeRef}
+        title={`Proxied Content for ${shortCode}`}
+        className={`w-full h-full border-0 transition-opacity duration-300 ${isLoading || (error && !isLoading) ? 'opacity-0' : 'opacity-100'}`}
+        // Sandbox attributes can be adjusted.
+        // 'allow-scripts' & 'allow-forms' are often needed.
+        // 'allow-same-origin' is tricky: if the iframe content *needs* its own origin (e.g. script.google.com) for its cookies/storage, this is fine.
+        // However, if we wanted to *interact* with the iframe content from parent (which we can't much cross-origin anyway), this would be relevant.
+        // For merely displaying, default sandbox or more permissive like below is common.
+        sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-modals allow-top-navigation-by-user-activation"
+        // src is set in useEffect
+      />
     </div>
   );
 };
